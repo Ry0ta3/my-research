@@ -26,7 +26,7 @@ if torch.cuda.is_available():
 # 1. 探索するハイパーパラメータ空間を定義
 # ==============================================================================
 # 色々な値を試せるようにリストで定義
-K1_rating_list = [1, 1.0, 1]
+K1_rating_list = [1, 1, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3]
 
 # すべての組み合わせを生成
 search_space = list(itertools.product(K1_rating_list))
@@ -266,7 +266,7 @@ def solve_admm(
         u1 = u1 + D_op(x) - y
         u2 = u2 + x - z
         
-        if i % 10 == 0:
+        if i % 5 == 0:
             recon_error = np.linalg.norm(x - w) / np.linalg.norm(w)
             print(f"Iteration {i+1}/{n_iter}, Reconstruction Error: {recon_error:.4f}")
 
@@ -287,8 +287,12 @@ testloader = DataLoader(testset, batch_size=400, shuffle=False)
 
 import json
 # JSONファイルから辞書を読み込む
-with open('90cut_data.json', 'r') as f:
+with open('99cut_data.json', 'r') as f:
     zero_ratings = json.load(f)
+
+with open('99cut_TV.json', 'r') as f:
+    target_TVs = json.load(f)
+
 
 for i, (k1_rating, ) in enumerate(search_space):
     print("\n" + "="*80)
@@ -326,11 +330,11 @@ for i, (k1_rating, ) in enumerate(search_space):
             w_numpy = module.weight.detach().clone().to('cpu').numpy().astype(np.float64)
 
             # --- パラメータ設定と実行 ---
-            K1_val = layer_tvs[name]*k1_rating       # Total Variationの上限
+            K1_val = target_TVs[name]*k1_rating       # Total Variationの上限
             K0_ratio_val = 1 - zero_ratings[name]   # 10%を非ゼロにする (目標のスパース率90%)
-            rho_val = 1.0        # block性ペナルティパラメータ
-            gamma_val = 15.0   # sparse性ペナルティパラメータ
-            iterations = 30   # 繰り返し回数
+            rho_val = 0.01        # block性ペナルティパラメータ
+            gamma_val = 15   # sparse性ペナルティパラメータ
+            iterations = 300   # 繰り返し回数
 
             # ADMMソルバーを実行
             x_final = solve_admm(
