@@ -68,7 +68,7 @@ testset = torchvision.datasets.CIFAR10(root="./data", train=False, download=True
 testloader = DataLoader(testset, batch_size=400, shuffle=False)
 
 
-for i in range(80, 100):
+for i in [10, 20, 30, 40, 50, 60, 70, 80, 85, 90, 95, 99]:
     print("\n" + "="*80)
     print(f"{i}%枝刈り")
     print("="*80)

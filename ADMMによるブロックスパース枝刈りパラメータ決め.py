@@ -287,10 +287,10 @@ testloader = DataLoader(testset, batch_size=400, shuffle=False)
 
 import json
 # JSONファイルから辞書を読み込む
-with open('99cut_data.json', 'r') as f:
+with open('80cut_data.json', 'r') as f:
     zero_ratings = json.load(f)
 
-with open('99cut_TV.json', 'r') as f:
+with open('80cut_TV.json', 'r') as f:
     target_TVs = json.load(f)
 
 
