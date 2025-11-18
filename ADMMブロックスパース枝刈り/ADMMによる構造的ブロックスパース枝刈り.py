@@ -1,3 +1,8 @@
+import os
+
+# TensorFlowやPyTorchをインポートする前に設定
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -281,7 +286,7 @@ def solve_admm(
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
-pt_model_path = "dense.pt"
+pt_model_path = "../dense.pt"
 # データローダーの準備
 transform = transforms.Compose([transforms.Resize(224), transforms.ToTensor(), transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
 trainset = torchvision.datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
@@ -296,10 +301,10 @@ for i, (prune_rating, ) in enumerate(search_space):
     print("="*80)
 
     # JSONファイルから辞書を読み込む
-    with open(f'{prune_rating}cut_data.json', 'r') as f:
+    with open(f'../その他/{prune_rating}cut_data.json', 'r') as f:
         zero_ratings = json.load(f)
 
-    with open(f'{prune_rating}cut_TV.json', 'r') as f:
+    with open(f'../その他/{prune_rating}cut_TV.json', 'r') as f:
         target_TVs = json.load(f)
 
     # --- ステップA: モデルを毎回初期化 ---
@@ -332,7 +337,7 @@ for i, (prune_rating, ) in enumerate(search_space):
             w_numpy = module.weight.detach().clone().to('cpu').numpy().astype(np.float64)
 
             # --- パラメータ設定と実行 ---
-            K1_val = target_TVs[name]*0.9       # Total Variationの上限
+            K1_val = target_TVs[name]*0.5       # Total Variationの上限
             K0_ratio_val = 1 - zero_ratings[name]   # 10%を非ゼロにする (目標のスパース率90%)
             rho_val = 0.01        # block性ペナルティパラメータ
             gamma_val = 15.0   # sparse性ペナルティパラメータ
@@ -385,8 +390,6 @@ for i, (prune_rating, ) in enumerate(search_space):
     all_conv_zeros = 0
 
     import torch_pruning as tp
-    #print(tp.__version__)
-    #print(tp.__file__)
 
     # 準備ができたモデルをGPU/CPUに送る
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -406,9 +409,10 @@ for i, (prune_rating, ) in enumerate(search_space):
             # フィルター（out_channels次元）ごとに、絶対値の合計を計算
             # dim=(1,2,3) は in_channels, height, width の次元を潰すという意味
             filter_sum = torch.sum(torch.abs(weight), dim=(1, 2, 3))
-            
+            filter_ave = filter_sum / (weight.size()[1]*weight.size()[2]*weight.size()[3]) 
+
             # 合計が0のフィルター（＝全ての重みが0のフィルター）のインデックスを見つける
-            indices_to_prune = torch.where(filter_sum == 0)[0].tolist()
+            indices_to_prune = torch.where((filter_sum <= 0.5) & (filter_ave<=0.005))[0].tolist()
             
             # 刈るべきフィルターが1つでもあれば、辞書に記録
             if indices_to_prune:
@@ -466,7 +470,7 @@ for i, (prune_rating, ) in enumerate(search_space):
     ####### 密モデルに対して枝刈り計画を作成し、実行
 
     # 密モデルの重みに対してマスクをかける
-    pt_model_path = "dense.pt"
+    pt_model_path = "../dense.pt"
     model = models.resnet18()
     model.fc = nn.Linear(model.fc.in_features, 10)  # CIFAR-10 にあわせて出力層変更
     model.load_state_dict(torch.load(pt_model_path))
@@ -534,7 +538,7 @@ for i, (prune_rating, ) in enumerate(search_space):
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     scheduler = CosineAnnealingLR(optimizer, T_max=15, eta_min=0)
     epoch_loss_list = []
-    for epoch in range(15):
+    for epoch in range(30):
         model.train()
         total_loss = 0.0
         num_train = 0
@@ -549,13 +553,13 @@ for i, (prune_rating, ) in enumerate(search_space):
             num_train+=labels.size(0)
 
         epoch_loss_list.append(total_loss/num_train)
-        print(f'Epoch[{epoch+1}/15], Loss: {epoch_loss_list[epoch]:.4f}')
+        print(f'Epoch[{epoch+1}/30], Loss: {epoch_loss_list[epoch]:.4f}')
         # 次のエポックへの準備
         if epoch >= 1:
             if np.abs(epoch_loss_list[epoch]-epoch_loss_list[epoch-1]) < 0.001:
+                print('early stop')
                 break
         scheduler.step()
-        # print(f"再訓練 Epoch {epoch+1}/15, Loss: {loss.item():.4f}")
     
     # 永続化
     for name, module in model.named_modules():
@@ -565,7 +569,7 @@ for i, (prune_rating, ) in enumerate(search_space):
     # --- ステップF: 評価 ---
     final_accuracy = accuracy_test(model, testloader, device)
     
-    onnx_path = f"temp_model_{i}.onnx"
+    onnx_path = f"temp_model_{prune_rating}.onnx"
     model_to_onnx(model, onnx_path)
     inference_speed = run_benchmark(onnx_path, batch_size=400)
 
@@ -588,7 +592,7 @@ for i, (prune_rating, ) in enumerate(search_space):
         "final_layer_tvs": final_layer_tvs,
         "layer_relative_tvs": layer_relative_tvs,
         "final_layer_relative_tvs": final_layer_relative_tvs,
-        "k1_rating": 0.9,
+        "k1_rating": 0.5,
         "sparsity(%)": sparsity,
         "accuracy(%)": final_accuracy,
         "median_speed(ms)": inference_speed
