@@ -69,7 +69,7 @@ testset = torchvision.datasets.CIFAR10(root="../data", train=False, download=Tru
 testloader = DataLoader(testset, batch_size=400, shuffle=False)
 
 
-for i in [99, 99.1, 99.2, 99.3, 99.4, 99.5, 99.6, 99.7, 99.8, 99.9, 99.92, 99.94, 99.96]:
+for i in [99, 99.1, 99.2, 99.3, 99.4, 99.5, 99.6]:
     print("\n" + "="*80)
     print(f"{i}%枝刈り")
     print("="*80)
@@ -93,10 +93,114 @@ for i in [99, 99.1, 99.2, 99.3, 99.4, 99.5, 99.6, 99.7, 99.8, 99.9, 99.92, 99.94
         amount = cut_rate,
     )
 
+    # この後に非構造枝刈りを行うのでマスクとモデルのサイズが異なるのを防ぐために永続化（マスクと重みを掛ける）
+    for module in model.modules():
+        if isinstance(module, torch.nn.Conv2d):
+            prune.remove(module, "weight")
+
     # ゼロ比率を表示
     for name, module in model.named_modules():
         if isinstance(module, torch.nn.Conv2d):
             print(f"{name} Zero-Ratio: {100.0 * float(torch.sum(module.weight == 0)) / float(module.weight.nelement()):.2f}%")
+
+    import torch_pruning as tp
+
+    # 準備ができたモデルをGPU/CPUに送る
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+
+    ####### ADMM後のモデルを用いて枝刈りターゲットを特定
+
+    # 枝刈りしたいモジュール名と、その中で削除するチャネルのインデックスを保存する辞書
+    pruning_targets_by_name = {}
+
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Conv2d):
+            # 重みテンソルを取得 (out_channels, in_channels, h, w)
+            weight = module.weight.detach()
+            
+            # フィルター（out_channels次元）ごとに、絶対値の合計を計算
+            # dim=(1,2,3) は in_channels, height, width の次元を潰すという意味
+            filter_sum = torch.sum(torch.abs(weight), dim=(1, 2, 3))
+            filter_ave = filter_sum / (weight.size()[1]*weight.size()[2]*weight.size()[3])
+            
+            # 合計が0のフィルター（＝全ての重みが0のフィルター）のインデックスを見つける
+            indices_to_prune = torch.where((filter_sum <= 0.5) & (filter_ave<=0.005))[0].tolist()   # filter_sum == 0 
+            
+            # 刈るべきフィルターが1つでもあれば、辞書に記録
+            if indices_to_prune:
+                pruning_targets_by_name[name] = indices_to_prune
+                print(f"レイヤー '{name}': {len(indices_to_prune)}個のフィルターを枝刈り対象として特定。")
+
+    #######
+
+    # 非構造枝刈りのためのmaskを作るためにADMM後のモデルに対し非構造枝刈りを行う
+    # 依存関係グラフを構築するためのダミー入力
+    # 値はランダムでOK。形状が正しいことが重要。
+    example_inputs = torch.randn(1, 3, 224, 224).to(device)
+
+    # ★★★ ここからが、より堅牢なワークフロー ★★★
+
+    # 1. 依存関係グラフを構築 (これは変更なし)
+    DG = tp.DependencyGraph()
+    DG.build_dependency(model, example_inputs=example_inputs)
+
+    # 2. 枝刈りグループのリストを作成する
+    pruning_groups = []
+    for name, indices in pruning_targets_by_name.items():
+        # ターゲットのモジュールを取得
+        module_to_prune = model.get_submodule(name)
+        
+        # 3. DG.get_pruning_groupを使って、依存関係を明示的に解決させる
+        #    このグループには、conv1だけでなく、bn1なども自動的に含まれる
+        group = DG.get_pruning_group(
+            module=module_to_prune, 
+            pruning_fn=tp.function.prune_conv_out_channels,  
+            idxs=indices
+        )
+        pruning_groups.append(group)
+        print(f"レイヤー '{name}' の枝刈りグループを作成: {group}")
+
+    # 4. グループを一つずつ実行する
+    for group in pruning_groups:
+        # 念のため、グループが有効かチェック
+        if DG.check_pruning_group(group):
+            group.prune()
+
+    # maskをつくる
+    threshold = 0
+
+    masks = {}
+
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Conv2d):
+            # 現在の重みを取得
+            weights = module.weight.detach()
+            
+            # 閾値に基づいてマスクを作成 (絶対値が0でない要素が1、0であれば0)
+            masks[name] = (torch.abs(weights) != threshold).float().to(weights.device)
+
+    # maskをかける
+    for name, module in model.named_modules(): 
+        if name in masks:
+            prune.CustomFromMask.apply(module, "weight", mask=masks[name])
+
+    # 構造的かつ非構造枝刈りしたときのゼロ比率を表示
+    all_conv_params = 0
+    all_conv_zeros = 0
+
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Conv2d):
+            print(f"{name} Zero-Ratio: {100.0 * float(torch.sum(module.weight == 0)) / float(module.weight.nelement()):.4f}%")
+            weight_after_pruning = module.weight
+            num_zeros = (weight_after_pruning == 0).sum().item()
+            total_params = weight_after_pruning.numel()
+            all_conv_params += total_params
+            all_conv_zeros += num_zeros
+
+    sparsity = 100. * all_conv_zeros / all_conv_params if all_conv_params > 0 else 0
+    print(f"全畳み込み層の0率：{sparsity:.4f}%")
 
     # 再訓練
     criterion = nn.CrossEntropyLoss()
@@ -148,14 +252,15 @@ for i in [99, 99.1, 99.2, 99.3, 99.4, 99.5, 99.6, 99.7, 99.8, 99.9, 99.92, 99.94
     start = time.time()
     final_accuracy = accuracy_test(model, testloader, device)
     gpu_speed = time.time()-start
-
+    
     onnx_path = f"temp_model_{i}.onnx"
     model_to_onnx(model, onnx_path)
     inference_speed = run_benchmark(onnx_path, batch_size=400)
 
     # --- ステップG: 結果の記録 ---
     current_result = {
-        "sparsity(%)": i,
+        "pruning_sparsity(%)": i,
+        "final_sparsity(%)": sparsity,
         "accuracy(%)": final_accuracy,
         "median_speed(ms)": inference_speed,
         "gpu_speed(s)": gpu_speed
