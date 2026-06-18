@@ -36,7 +36,7 @@ if torch.cuda.is_available():
 # 1. 探索するハイパーパラメータ空間を定義
 # ==============================================================================
 # 色々な値を試せるようにリストで定義
-k1_rating_list = [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3]
+k1_rating_list = [0.9, 0.5]
 
 # すべての組み合わせを生成
 search_space = list(itertools.product(k1_rating_list))
@@ -301,7 +301,7 @@ for i, (k1_rating, ) in enumerate(search_space):
     print(f"パラメータ: k1_rating={k1_rating}")
     print("="*80)
 
-    prune_rating = 99.4
+    prune_rating = 99
 
     # JSONファイルから辞書を読み込む
     with open(f'../その他/{prune_rating}cut_data.json', 'r') as f:
@@ -415,7 +415,7 @@ for i, (k1_rating, ) in enumerate(search_space):
             filter_ave = filter_sum / (weight.size()[1]*weight.size()[2]*weight.size()[3]) 
 
             # 合計が0のフィルター（＝全ての重みが0のフィルター）のインデックスを見つける
-            indices_to_prune = torch.where((filter_sum <= 0.5) & (filter_ave<=0.005))[0].tolist()
+            indices_to_prune = torch.where(filter_sum == 0)[0].tolist()   # (filter_sum <= 0.5) & (filter_ave<=0.005)
             
             # 刈るべきフィルターが1つでもあれば、辞書に記録
             if indices_to_prune:

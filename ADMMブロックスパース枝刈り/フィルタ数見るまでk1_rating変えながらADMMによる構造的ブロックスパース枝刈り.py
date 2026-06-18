@@ -1,14 +1,23 @@
+import os
+
+# TensorFlowやPyTorchをインポートする前に設定
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.utils.prune as prune
 import torchvision.models as models
+from torch.onnx import export
 import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
-from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR
+import json
+from torch.nn.utils import parameters_to_vector
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import itertools
 import pandas as pd
 from deepsparse.benchmark.benchmark_model import benchmark_model
@@ -27,10 +36,10 @@ if torch.cuda.is_available():
 # 1. 探索するハイパーパラメータ空間を定義
 # ==============================================================================
 # 色々な値を試せるようにリストで定義
-K1_rating_list = [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3]
+k1_rating_list = [1.0, 0.9, 0.5, 0.3, 0.1]
 
 # すべての組み合わせを生成
-search_space = list(itertools.product(K1_rating_list))
+search_space = list(itertools.product(k1_rating_list))
 
 # 結果を格納するためのリスト
 results_log = []
@@ -269,7 +278,7 @@ def solve_admm(
         
         if i % 5 == 0:
             recon_error = np.linalg.norm(x - w) / np.linalg.norm(w)
-            print(f"Iteration {i+1}/{n_iter}, Reconstruction Error: {recon_error:.4f}")
+            #print(f"Iteration {i+1}/{n_iter}, Reconstruction Error: {recon_error:.4f}")
 
     return x
 # ==============================================================================
@@ -278,7 +287,7 @@ def solve_admm(
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
-pt_model_path = "dense.pt"
+pt_model_path = "../dense.pt"
 # データローダーの準備
 transform = transforms.Compose([transforms.Resize(224), transforms.ToTensor(), transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
 trainset = torchvision.datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
@@ -286,20 +295,20 @@ trainloader = DataLoader(trainset, batch_size=400, shuffle=True)
 testset = torchvision.datasets.CIFAR10(root="./data", train=False, download=True, transform=transform)
 testloader = DataLoader(testset, batch_size=400, shuffle=False)
 
-import json
-# JSONファイルから辞書を読み込む
-with open('../その他/90cut_data.json', 'r') as f:
-    zero_ratings = json.load(f)
-
-with open('../その他/90cut_TV.json', 'r') as f:
-    target_TVs = json.load(f)
-
-
 for i, (k1_rating, ) in enumerate(search_space):
     print("\n" + "="*80)
     print(f"グリッドサーチ試行: {i+1}/{len(search_space)}")
     print(f"パラメータ: k1_rating={k1_rating}")
     print("="*80)
+
+    prune_rating = 90
+
+    # JSONファイルから辞書を読み込む
+    with open(f'../その他/{prune_rating}cut_data.json', 'r') as f:
+        zero_ratings = json.load(f)
+
+    with open(f'../その他/{prune_rating}cut_TV.json', 'r') as f:
+        target_TVs = json.load(f)
 
     # --- ステップA: モデルを毎回初期化 ---
     model = models.resnet18() 
@@ -320,11 +329,9 @@ for i, (k1_rating, ) in enumerate(search_space):
             layer_tvs[name] = tv
             layer_relative_tvs[name] = relative_tv
             conv_layer_names.append(name)
-            print(f"{name}：TV={tv:.4f}     ave_TV={ave_tv:.4f}     relative_TV={relative_tv:.4f}")
 
     for name, module in model.named_modules():
         if isinstance(module, nn.Conv2d):
-            print(f"\n--- レイヤー '{name}' の処理を開始 ---")
 
             # wを4階テンソルのまま取得
             # .detach().clone()で勾配情報を切り離し、安全なコピーを作成し、numpyに変換、scipyのcg法に合うようにfloat64に
@@ -334,7 +341,7 @@ for i, (k1_rating, ) in enumerate(search_space):
             K1_val = target_TVs[name]*k1_rating       # Total Variationの上限
             K0_ratio_val = 1 - zero_ratings[name]   # 10%を非ゼロにする (目標のスパース率90%)
             rho_val = 0.01        # block性ペナルティパラメータ
-            gamma_val = 15   # sparse性ペナルティパラメータ
+            gamma_val = 15.0   # sparse性ペナルティパラメータ
             iterations = 300   # 繰り返し回数
 
             # ADMMソルバーを実行
@@ -349,161 +356,56 @@ for i, (k1_rating, ) in enumerate(search_space):
                 n_iter=iterations
             )
             with torch.no_grad():
+                # 閾値で0に近い値を完全な0にする
+                x_final[np.abs(x_final) <= 1e-4] = 0
+                # モデルを上書き
                 module.weight.copy_(torch.tensor(x_final))
 
-            # 閾値で0に近い値を完全な0にする
-            x_final[np.abs(x_final) <= 1e-4] = 0
+    # 非構造時のゼロ比率を表示
+    all_conv_params = 0
+    all_conv_zeros = 0
 
-            # 結果の簡単な確認
-            print("\n結果:")
-            #print(x_final)
-            print(f"元の重みテンソルの非ゼロの要素数: {np.sum(w_numpy != 0)}")
-            print(f"ADMM後の重みテンソルの非ゼロの要素数: {np.sum(x_final != 0)} (目標数{int(K0_ratio_val * w_numpy.size)})")
-            print(f"||Dx||_1: {np.sum(np.abs(D_op_4d(x_final))):.4f} (制約は{K1_val}以下)")
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Conv2d):
+            weight_after_pruning = module.weight
+            num_zeros = (weight_after_pruning == 0).sum().item()
+            total_params = weight_after_pruning.numel()
+            all_conv_params += total_params
+            all_conv_zeros += num_zeros
+
+    sparsity = 100. * all_conv_zeros / all_conv_params if all_conv_params > 0 else 0
+    print(f"全畳み込み層の0率：{sparsity:.4f}%")
 
     # --- ステップD: 枝刈りとスパース率の計算 ---
     threshold = 1e-4
     masks = {}
     all_conv_params = 0
     all_conv_zeros = 0
-    
-    # 枝刈り前に元の密モデルを再度ロード
-    pruned_model = models.resnet18()
-    pruned_model.fc = nn.Linear(pruned_model.fc.in_features, 10)
-    pruned_model.load_state_dict(torch.load(pt_model_path))
-    pruned_model.to(device)
-    
-    # マスクの作成
-    for name, module in model.named_modules(): # 最適化後のモデルからマスクを作る
-        if isinstance(module, nn.Conv2d):
-             weights = module.weight.detach()
-             masks[name] = (torch.abs(weights) > threshold).float()
 
-    # マスクの適用
-    for name, module in pruned_model.named_modules(): # 密モデルにマスクを適用
-        if name in masks:
-            prune.CustomFromMask.apply(module, "weight", mask=masks[name].to(device))
-            weight_after_pruning = module.weight
-            num_zeros = (weight_after_pruning == 0).sum().item()
-            total_params = weight_after_pruning.numel()
-            print(f"{name} Zero-Ratio: {(100.0*num_zeros/total_params):.4f}")
-            print(f"{total_params - num_zeros}")  #これが0ならほんとに100%
-            all_conv_params += total_params
-            all_conv_zeros += num_zeros
-            
-    sparsity = 100. * all_conv_zeros / all_conv_params if all_conv_params > 0 else 0
-    print(f"全畳み込み層の0率：{sparsity:.2f}%")
+    # 準備ができたモデルをGPU/CPUに送る
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
 
-    # --- ステップE: 再訓練 ---
-    pruned_model.to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(pruned_model.parameters(), lr=0.001)
-    scheduler = CosineAnnealingLR(optimizer, T_max=15, eta_min=0)
-    epoch_loss_list = []
-    for epoch in range(15):
-        pruned_model.train()
-        total_loss = 0.0
-        num_train = 0
-        for inputs, labels in trainloader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            optimizer.zero_grad()
-            outputs = pruned_model(inputs)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()*labels.size(0)
-            num_train+=labels.size(0)
 
-        epoch_loss_list.append(total_loss/num_train)
-        print(f'Epoch[{epoch+1}/15], Loss: {epoch_loss_list[epoch]:.4f}')
-        # 次のエポックへの準備
-        if epoch >= 1:
-            if np.abs(epoch_loss_list[epoch]-epoch_loss_list[epoch-1]) < 0.001:
-                break
-        scheduler.step()
-        # print(f"再訓練 Epoch {epoch+1}/15, Loss: {loss.item():.4f}")
-    
-    # 永続化
-    for name, module in pruned_model.named_modules():
-        if isinstance(module, torch.nn.Conv2d) and prune.is_pruned(module):
-            prune.remove(module, "weight")
+    ####### ADMM後のモデルを用いて枝刈りターゲットを特定
 
-    # --- ステップF: 評価 ---
-    start = time.time()
-    final_accuracy = accuracy_test(pruned_model, testloader, device)
-    gpu_speed = time.time()-start
-    
-    onnx_path = f"temp_model_{i}.onnx"
-    model_to_onnx(pruned_model, onnx_path)
-    inference_speed = run_benchmark(onnx_path, batch_size=400)
-
-    final_layer_tvs = {}
-    final_layer_relative_tvs = {}
+    # 枝刈りしたいモジュール名と、その中で削除するチャネルのインデックスを保存する辞書
+    pruning_targets_by_name = {}
 
     for name, module in model.named_modules():
         if isinstance(module, nn.Conv2d):
-            w_tensor = module.weight.detach().clone().to(device)
-            tv = Omega(w_tensor).item()
-            ave_tv = tv/(w_tensor).numel()
-            relative_tv = tv / torch.sum(torch.abs(w_tensor)).item()
-            final_layer_tvs[name] = tv
-            final_layer_relative_tvs[name] = relative_tv
-            print(f"{name}：TV={tv:.4f}     ave_TV={ave_tv:.4f}     relative_TV={relative_tv:.4f}")
+            # 重みテンソルを取得 (out_channels, in_channels, h, w)
+            weight = module.weight.detach()
+            
+            # フィルター（out_channels次元）ごとに、絶対値の合計を計算
+            # dim=(1,2,3) は in_channels, height, width の次元を潰すという意味
+            filter_sum = torch.sum(torch.abs(weight), dim=(1, 2, 3))
+            filter_ave = filter_sum / (weight.size()[1]*weight.size()[2]*weight.size()[3]) 
 
-    # --- ステップG: 結果の記録 ---
-    current_result = {
-        "layer_tvs": layer_tvs,
-        "final_layer_tvs": final_layer_tvs,
-        "layer_relative_tvs": layer_relative_tvs,
-        "final_layer_relative_tvs": final_layer_relative_tvs,
-        "k1_rating": k1_rating,
-        "sparsity(%)": sparsity,
-        "accuracy(%)": final_accuracy,
-        "median_speed(ms)": inference_speed,
-        "gpu_speed(s)": gpu_speed
-    }
-    results_log.append(current_result)
-
-# ==============================================================================
-# 4. 全ての試行が完了した後、結果を表示
-# ==============================================================================
-############################################################################
-#pip installの代わり
-import subprocess
-import sys
-
-# pipコマンドをリスト形式で指定
-# 'numpy'の部分をインストールしたいパッケージ名に書き換える
-command = [sys.executable, "-m", "pip", "install", "openpyxl"]
-
-# コマンドを実行
-subprocess.run(command)
-########################################################################
-
-print("\n" + "#"*80)
-print("グリッドサーチが完了しました。")
-print("#"*80)
-
-# pandas DataFrameで見やすく表示
-df_results = pd.DataFrame(results_log)
-print(df_results)
-
-# 最も正解率が高い組み合わせ
-best_accuracy_run = df_results.loc[df_results['accuracy(%)'].idxmax()]
-print("\n--- 正解率が最も高い結果 ---")
-print(best_accuracy_run)
-
-# 最も枝刈り率が高い組み合わせ
-best_sparsity_run = df_results.loc[df_results['sparsity(%)'].idxmax()]
-print("\n--- 枝刈り率が最も高い結果 ---")
-print(best_sparsity_run)
-
-output_excel_path = "ADMM_hyperparameter_search_results.xlsx"
-
-# ExcelWriterを使って、複数のシートに書き込む
-with pd.ExcelWriter(output_excel_path) as writer:
-    df_results.to_excel(writer, sheet_name='全結果', index=False)
-    best_accuracy_run.to_excel(writer, sheet_name='正解率ベスト', index=False)
-    best_sparsity_run.to_excel(writer, sheet_name='枝刈り率ベスト', index=False)
-
-print(f"\n詳細な結果を '{output_excel_path}' の複数シートに保存しました。")
+            # 合計が0のフィルター（＝全ての重みが0のフィルター）のインデックスを見つける
+            indices_to_prune = torch.where(filter_sum == 0)[0].tolist()   # (filter_sum <= 0.5) & (filter_ave<=0.005)
+            
+            # 刈るべきフィルターが1つでもあれば、辞書に記録
+            if indices_to_prune:
+                pruning_targets_by_name[name] = indices_to_prune
+                print(f"レイヤー '{name}': {len(indices_to_prune)}個のフィルターを枝刈り対象として特定。")
